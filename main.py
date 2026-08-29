@@ -1,23 +1,35 @@
 import os
+import uuid
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 
 import requests
 from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
 from coinbase.rest import RESTClient
 
 app = FastAPI(
     title="Quant Bot Backend",
-    version="1.0.0",
-    description="Coinbase market scanner and strategy API. Trading is disabled by default.",
+    version="1.1.0",
+    description="Coinbase market scanner with guarded Coinbase Advanced Trade execution support.",
 )
 
 COINBASE_API_KEY = os.getenv("COINBASE_API_KEY", "")
 COINBASE_API_SECRET = os.getenv("COINBASE_API_SECRET", "")
 TRADING_ENABLED = os.getenv("TRADING_ENABLED", "false").lower() == "true"
+DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
+KILL_SWITCH = os.getenv("KILL_SWITCH", "false").lower() == "true"
+MAX_ORDER_USD = float(os.getenv("MAX_ORDER_USD", "10"))
 
 PUBLIC_BASE = "https://api.exchange.coinbase.com"
-DEFAULT_HEADERS = {"User-Agent": "quant-bot-backend/1.0"}
+DEFAULT_HEADERS = {"User-Agent": "quant-bot-backend/1.1"}
+
+
+class TradeRequest(BaseModel):
+    product_id: str = Field(default="BTC-USD", examples=["BTC-USD"])
+    side: Literal["BUY", "SELL"]
+    size_usd: float = Field(gt=0)
+    require_signal: bool = True
 
 
 def _get_json(url: str, params: dict[str, Any] | None = None) -> Any:
@@ -48,18 +60,28 @@ def _rsi(values: list[float], period: int = 14) -> float | None:
     return 100.0 - (100.0 / (1.0 + rs))
 
 
+def _client() -> RESTClient:
+    if not COINBASE_API_KEY or not COINBASE_API_SECRET:
+        raise HTTPException(status_code=503, detail="Coinbase credentials are not configured")
+    return RESTClient(api_key=COINBASE_API_KEY, api_secret=COINBASE_API_SECRET)
+
+
 @app.get("/")
 def root() -> dict[str, Any]:
     return {
         "name": "Quant Bot Backend",
         "status": "online",
         "trading_enabled": TRADING_ENABLED,
+        "dry_run": DRY_RUN,
+        "kill_switch": KILL_SWITCH,
+        "max_order_usd": MAX_ORDER_USD,
         "endpoints": [
             "/health",
             "/price/BTC-USD",
             "/signal/BTC-USD",
             "/scan?products=BTC-USD,ETH-USD,SOL-USD",
             "/coinbase-auth-check",
+            "POST /trade",
         ],
     }
 
@@ -71,6 +93,9 @@ def health() -> dict[str, Any]:
         "time": datetime.now(timezone.utc).isoformat(),
         "coinbase_credentials_present": bool(COINBASE_API_KEY and COINBASE_API_SECRET),
         "trading_enabled": TRADING_ENABLED,
+        "dry_run": DRY_RUN,
+        "kill_switch": KILL_SWITCH,
+        "max_order_usd": MAX_ORDER_USD,
     }
 
 
@@ -151,7 +176,8 @@ def build_signal(product_id: str) -> dict[str, Any]:
         "reasons": reasons,
         "timeframe": "1h",
         "trading_enabled": TRADING_ENABLED,
-        "note": "Signal is informational and is not an order.",
+        "dry_run": DRY_RUN,
+        "note": "Signal is informational unless an explicit POST /trade request is accepted.",
     }
 
 
@@ -184,19 +210,99 @@ def coinbase_auth_check() -> dict[str, Any]:
         return {"connected": False, "reason": "Coinbase environment variables are missing"}
 
     try:
-        client = RESTClient(api_key=COINBASE_API_KEY, api_secret=COINBASE_API_SECRET)
+        client = _client()
         client.get_accounts(limit=1)
         return {
             "connected": True,
             "credentials_present": True,
             "trading_enabled": TRADING_ENABLED,
+            "dry_run": DRY_RUN,
+            "kill_switch": KILL_SWITCH,
             "note": "Credentials authenticated successfully; no balances or secrets are exposed.",
         }
+    except HTTPException:
+        raise
     except Exception as exc:
         return {
             "connected": False,
             "credentials_present": True,
             "trading_enabled": TRADING_ENABLED,
+            "dry_run": DRY_RUN,
             "error_type": type(exc).__name__,
             "note": "Authentication failed. Check the Coinbase API key name/secret format and permissions.",
         }
+
+
+@app.post("/trade")
+def trade(request: TradeRequest) -> dict[str, Any]:
+    product = request.product_id.strip().upper()
+    side = request.side.upper()
+
+    if KILL_SWITCH:
+        raise HTTPException(status_code=423, detail="Trading kill switch is active")
+
+    if request.size_usd > MAX_ORDER_USD:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Order exceeds MAX_ORDER_USD safety limit of ${MAX_ORDER_USD:.2f}",
+        )
+
+    signal_data = build_signal(product)
+    required_signal = "BULLISH" if side == "BUY" else "BEARISH"
+    if request.require_signal and signal_data["signal"] != required_signal:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Trade blocked: {side} requires {required_signal}, current signal is {signal_data['signal']}",
+        )
+
+    client_order_id = str(uuid.uuid4())
+    current_price = float(signal_data["price"])
+    estimated_base_size = request.size_usd / current_price
+
+    preview = {
+        "client_order_id": client_order_id,
+        "product_id": product,
+        "side": side,
+        "size_usd": round(request.size_usd, 2),
+        "estimated_base_size": round(estimated_base_size, 12),
+        "reference_price": current_price,
+        "signal": signal_data["signal"],
+        "risk_limit_usd": MAX_ORDER_USD,
+    }
+
+    if DRY_RUN or not TRADING_ENABLED:
+        return {
+            "accepted": True,
+            "executed": False,
+            "mode": "DRY_RUN",
+            "preview": preview,
+            "note": "No Coinbase order was submitted.",
+        }
+
+    try:
+        client = _client()
+        if side == "BUY":
+            result = client.market_order_buy(
+                client_order_id=client_order_id,
+                product_id=product,
+                quote_size=f"{request.size_usd:.2f}",
+            )
+        else:
+            result = client.market_order_sell(
+                client_order_id=client_order_id,
+                product_id=product,
+                base_size=f"{estimated_base_size:.12f}",
+            )
+
+        response_data = result.to_dict() if hasattr(result, "to_dict") else str(result)
+        return {
+            "accepted": True,
+            "executed": True,
+            "mode": "LIVE",
+            "order": response_data,
+        }
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Coinbase Advanced Trade order submission failed: {type(exc).__name__}",
+        ) from exc
