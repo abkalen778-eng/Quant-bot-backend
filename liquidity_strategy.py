@@ -4,200 +4,105 @@ from typing import Any
 import requests
 
 PUBLIC_BASE = "https://api.exchange.coinbase.com"
-HEADERS = {"User-Agent": "quant-bot-liquidity-strategy/2.0"}
+HEADERS = {"User-Agent": "quant-bot-liquidity-core/3.0"}
 
 
 def _candles(product: str, granularity: int) -> list[dict[str, float]]:
-    r = requests.get(
-        f"{PUBLIC_BASE}/products/{product.upper()}/candles",
-        params={"granularity": granularity},
-        headers=HEADERS,
-        timeout=12,
-    )
+    r = requests.get(f"{PUBLIC_BASE}/products/{product.upper()}/candles", params={"granularity": granularity}, headers=HEADERS, timeout=12)
     r.raise_for_status()
-    raw = r.json()
-    rows = sorted(raw, key=lambda x: x[0])
-    return [
-        {"time": float(x[0]), "low": float(x[1]), "high": float(x[2]), "open": float(x[3]), "close": float(x[4]), "volume": float(x[5])}
-        for x in rows
-    ]
+    return [{"time":float(x[0]),"low":float(x[1]),"high":float(x[2]),"open":float(x[3]),"close":float(x[4]),"volume":float(x[5])} for x in sorted(r.json(), key=lambda x:x[0])]
 
 
-def _aggregate_4h(hourly: list[dict[str, float]]) -> list[dict[str, float]]:
-    out: list[dict[str, float]] = []
-    bucket: list[dict[str, float]] = []
-    bucket_id = None
-    for c in hourly:
-        current = int(c["time"] // 14400)
-        if bucket_id is None:
-            bucket_id = current
-        if current != bucket_id and bucket:
-            out.append({
-                "time": bucket[0]["time"],
-                "open": bucket[0]["open"],
-                "high": max(x["high"] for x in bucket),
-                "low": min(x["low"] for x in bucket),
-                "close": bucket[-1]["close"],
-                "volume": sum(x["volume"] for x in bucket),
-            })
-            bucket = []
-            bucket_id = current
-        bucket.append(c)
-    if bucket:
-        out.append({
-            "time": bucket[0]["time"],
-            "open": bucket[0]["open"],
-            "high": max(x["high"] for x in bucket),
-            "low": min(x["low"] for x in bucket),
-            "close": bucket[-1]["close"],
-            "volume": sum(x["volume"] for x in bucket),
-        })
-    return out
+def _session_levels(hourly: list[dict[str,float]]) -> tuple[float,float]:
+    # Mechanical crypto session proxy: previous completed UTC day high/low.
+    latest_day = int(hourly[-1]["time"] // 86400)
+    prev = [c for c in hourly if int(c["time"] // 86400) == latest_day - 1]
+    sample = prev if prev else hourly[-25:-1]
+    return max(c["high"] for c in sample), min(c["low"] for c in sample)
 
 
-def _range(candles: list[dict[str, float]], lookback: int) -> tuple[float, float]:
-    sample = candles[-lookback - 1:-1]
-    return max(x["high"] for x in sample), min(x["low"] for x in sample)
+def _hourly_levels(hourly: list[dict[str,float]], lookback: int = 12) -> tuple[float,float]:
+    sample = hourly[-lookback-1:-1]
+    return max(c["high"] for c in sample), min(c["low"] for c in sample)
 
 
-def _latest_sweep(five: list[dict[str, float]], lookback: int = 20, search: int = 8) -> dict[str, Any] | None:
-    start = max(lookback, len(five) - search)
-    for i in range(len(five) - 1, start - 1, -1):
-        prev = five[i - lookback:i]
-        hi = max(x["high"] for x in prev)
-        lo = min(x["low"] for x in prev)
-        c = five[i]
-        # Sweep above liquidity and close back below = bearish manipulation.
-        if c["high"] > hi and c["close"] < hi:
-            return {"direction": "BEARISH", "index": i, "level": hi, "sweep_price": c["high"], "time": int(c["time"])}
-        # Sweep below liquidity and close back above = bullish manipulation.
-        if c["low"] < lo and c["close"] > lo:
-            return {"direction": "BULLISH", "index": i, "level": lo, "sweep_price": c["low"], "time": int(c["time"])}
+def _sweep(five: list[dict[str,float]], levels: list[tuple[str,float]], search: int = 12) -> dict[str,Any] | None:
+    for i in range(len(five)-1, max(0,len(five)-search)-1, -1):
+        c=five[i]
+        for name,level in levels:
+            if c["low"] < level and c["close"] > level:
+                return {"direction":"BULLISH","index":i,"level":level,"level_name":name,"sweep_price":c["low"],"time":int(c["time"])}
+            if c["high"] > level and c["close"] < level:
+                return {"direction":"BEARISH","index":i,"level":level,"level_name":name,"sweep_price":c["high"],"time":int(c["time"])}
     return None
 
 
-def _mss_after_sweep(five: list[dict[str, float]], sweep: dict[str, Any]) -> bool:
-    i = int(sweep["index"])
-    if i < 4:
-        return False
-    pre = five[max(0, i - 4):i]
-    post = five[i:]
-    if sweep["direction"] == "BULLISH":
-        structural_high = max(x["high"] for x in pre)
-        return any(x["close"] > structural_high for x in post)
-    structural_low = min(x["low"] for x in pre)
-    return any(x["close"] < structural_low for x in post)
+def _five_bos(five:list[dict[str,float]], sweep:dict[str,Any]) -> bool:
+    i=int(sweep["index"])
+    if i < 4: return False
+    pre=five[max(0,i-4):i]
+    post=five[i+1:]
+    if sweep["direction"]=="BULLISH":
+        level=max(x["high"] for x in pre)
+        return any(x["close"] > level for x in post)
+    level=min(x["low"] for x in pre)
+    return any(x["close"] < level for x in post)
 
 
-def _recent_fvg(five: list[dict[str, float]], direction: str, lookback: int = 12) -> dict[str, float] | None:
-    start = max(2, len(five) - lookback)
-    for i in range(len(five) - 1, start - 1, -1):
-        a, c = five[i - 2], five[i]
-        if direction == "BULLISH" and a["high"] < c["low"]:
-            return {"low": a["high"], "high": c["low"], "mid": (a["high"] + c["low"]) / 2.0}
-        if direction == "BEARISH" and a["low"] > c["high"]:
-            return {"low": c["high"], "high": a["low"], "mid": (c["high"] + a["low"]) / 2.0}
-    return None
+def _inverse_fvg(five:list[dict[str,float]], direction:str, lookback:int=12) -> bool:
+    start=max(2,len(five)-lookback)
+    for i in range(start,len(five)):
+        a,c=five[i-2],five[i]
+        if direction=="BULLISH" and a["low"] > c["high"] and five[-1]["close"] > a["low"]: return True
+        if direction=="BEARISH" and a["high"] < c["low"] and five[-1]["close"] < a["high"]: return True
+    return False
 
 
-def _pullback_confluence(five: list[dict[str, float]], direction: str, fvg: dict[str, float] | None) -> tuple[bool, str]:
-    current = five[-1]
-    recent = five[-12:]
-    dealing_high = max(x["high"] for x in recent)
-    dealing_low = min(x["low"] for x in recent)
-    eq = (dealing_high + dealing_low) / 2.0
-    fvg_touch = bool(fvg and current["low"] <= fvg["high"] and current["high"] >= fvg["low"])
-    eq_touch = current["low"] <= eq <= current["high"]
-    if direction == "BULLISH":
-        directional_eq = current["low"] <= eq
-    else:
-        directional_eq = current["high"] >= eq
-    if fvg_touch:
-        return True, "5m fair-value-gap pullback"
-    if eq_touch or directional_eq:
-        return True, "5m equilibrium pullback"
-    return False, "no 5m pullback confluence"
+def _one_bos(one:list[dict[str,float]], direction:str, end:int, lookback:int=5) -> bool:
+    if end < lookback: return False
+    prev=one[end-lookback:end]
+    c=one[end]
+    if direction=="BULLISH": return c["close"] > max(x["high"] for x in prev)
+    return c["close"] < min(x["low"] for x in prev)
 
 
-def _one_minute_bos(one: list[dict[str, float]], direction: str, lookback: int = 5) -> tuple[bool, float]:
-    if len(one) < lookback + 2:
-        return False, 0.0
-    previous = one[-lookback - 1:-1]
-    current = one[-1]
-    if direction == "BULLISH":
-        level = max(x["high"] for x in previous)
-        return current["close"] > level, level
-    level = min(x["low"] for x in previous)
-    return current["close"] < level, level
+def _continuation_sequence(one:list[dict[str,float]], intended:str, window:int=30) -> tuple[bool,str]:
+    # Required continuation: 1m BOS opposite intended direction, then BOS back intended direction.
+    if len(one) < 12: return False,"not enough 1m data"
+    opposite="BEARISH" if intended=="BULLISH" else "BULLISH"
+    start=max(5,len(one)-window)
+    opposite_at=None
+    for i in range(start,len(one)-1):
+        if _one_bos(one,opposite,i): opposite_at=i
+    if opposite_at is None: return False,"waiting for opposite 1m BOS retrace"
+    for i in range(opposite_at+1,len(one)):
+        if _one_bos(one,intended,i): return True,"opposite 1m BOS retrace then intended-direction 1m BOS confirmed"
+    return False,"retrace confirmed; waiting for 1m BOS back in intended direction"
 
 
-def build_liquidity_signal(product: str) -> dict[str, Any]:
-    product = product.upper()
-    one = _candles(product, 60)
-    five = _candles(product, 300)
-    hourly = _candles(product, 3600)
-    four = _aggregate_4h(hourly)
-    if len(one) < 30 or len(five) < 40 or len(hourly) < 30 or len(four) < 6:
-        raise ValueError(f"Not enough market data for {product}")
+def _exit_draw(direction:str, price:float, levels:list[tuple[str,float]]) -> dict[str,Any] | None:
+    candidates=[(n,l) for n,l in levels if (l>price if direction=="BULLISH" else l<price)]
+    if not candidates: return None
+    name,level=min(candidates,key=lambda x:abs(x[1]-price))
+    return {"level_name":name,"price":level}
 
-    h1_hi, h1_lo = _range(hourly, 20)
-    h4_hi, h4_lo = _range(four, min(10, len(four) - 1))
-    current = one[-1]["close"]
 
-    sweep = _latest_sweep(five)
-    reasons: list[str] = []
+def build_liquidity_signal(product:str) -> dict[str,Any]:
+    product=product.upper()
+    one=_candles(product,60); five=_candles(product,300); hourly=_candles(product,3600)
+    if len(one)<40 or len(five)<40 or len(hourly)<30: raise ValueError(f"Not enough market data for {product}")
+    session_hi,session_lo=_session_levels(hourly); h1_hi,h1_lo=_hourly_levels(hourly)
+    levels=[("session_high",session_hi),("session_low",session_lo),("hourly_high",h1_hi),("hourly_low",h1_lo)]
+    price=one[-1]["close"]
+    sweep=_sweep(five,levels)
     if not sweep:
-        return {
-            "product": product,
-            "signal": "NO_TRADE",
-            "direction": None,
-            "price": current,
-            "setup_score": 0,
-            "reasons": ["No recent 5m liquidity sweep"],
-            "levels": {"1h_high": h1_hi, "1h_low": h1_lo, "4h_high": h4_hi, "4h_low": h4_lo},
-            "strategy": "liquidity_sweep_mtf_v1",
-        }
-
-    direction = sweep["direction"]
-    reasons.append(f"5m {direction.lower()} liquidity sweep confirmed")
-
-    # Require the sweep to occur near a meaningful 1h or 4h extreme (within 0.75%).
-    target_levels = [h1_lo, h4_lo] if direction == "BULLISH" else [h1_hi, h4_hi]
-    sweep_px = float(sweep["sweep_price"])
-    proximity = min(abs(sweep_px - x) / x for x in target_levels)
-    htf_ok = proximity <= 0.0075
-    if htf_ok:
-        reasons.append("Sweep occurred near 1h/4h liquidity")
-    else:
-        reasons.append("Sweep was not close enough to 1h/4h liquidity")
-
-    mss = _mss_after_sweep(five, sweep)
-    reasons.append("5m market-structure shift confirmed" if mss else "No 5m market-structure shift yet")
-
-    fvg = _recent_fvg(five, direction)
-    pullback, pullback_reason = _pullback_confluence(five, direction, fvg)
-    reasons.append(pullback_reason)
-
-    bos1, bos_level = _one_minute_bos(one, direction)
-    reasons.append("1m break of structure confirmed" if bos1 else "No 1m break of structure yet")
-
-    checks = [htf_ok, mss, pullback, bos1]
-    score = sum(1 for x in checks if x)
-    ready = all(checks)
-
-    return {
-        "product": product,
-        "signal": direction if ready else "NO_TRADE",
-        "direction": direction,
-        "price": current,
-        "setup_score": score,
-        "max_score": 4,
-        "trade_ready": ready,
-        "reasons": reasons,
-        "liquidity_sweep": sweep,
-        "fvg": fvg,
-        "one_minute_bos_level": bos_level,
-        "levels": {"1h_high": h1_hi, "1h_low": h1_lo, "4h_high": h4_hi, "4h_low": h4_lo},
-        "strategy": "liquidity_sweep_mtf_v1",
-        "note": "Mechanical interpretation of liquidity sweep -> 5m reversal -> pullback confluence -> 1m confirmation. No setup means no trade.",
-    }
+        return {"product":product,"signal":"NO_TRADE","trade_ready":False,"price":price,"reasons":["No session/hourly liquidity sweep"],"levels":dict(levels),"strategy":"tjr_core_liquidity_v1"}
+    direction=sweep["direction"]
+    reversal_bos=_five_bos(five,sweep)
+    reversal_ifvg=_inverse_fvg(five,direction)
+    reversal=reversal_bos or reversal_ifvg
+    continuation,continuation_reason=_continuation_sequence(one,direction)
+    target=_exit_draw(direction,price,levels)
+    ready=reversal and continuation and target is not None
+    reasons=[f"{sweep['level_name']} swept", "5m reversal confirmed by BOS/iFVG" if reversal else "waiting for 5m BOS or inverse FVG", continuation_reason, "liquidity-draw exit available" if target else "no valid session/hourly liquidity exit draw"]
+    return {"product":product,"signal":direction if ready else "NO_TRADE","direction":direction,"trade_ready":ready,"price":price,"reasons":reasons,"liquidity_sweep":sweep,"five_minute_bos":reversal_bos,"inverse_fvg":reversal_ifvg,"continuation_confirmed":continuation,"take_profit":target,"levels":dict(levels),"strategy":"tjr_core_liquidity_v1","note":"Uses only: session/hourly liquidity sweep -> 5m BOS or inverse FVG reversal -> opposite 1m BOS retrace -> 1m BOS back with intended direction -> exit at another session/hourly liquidity draw."}
