@@ -7,10 +7,18 @@ from typing import Any, Literal
 
 import requests
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from coinbase.rest import RESTClient
 
-app = FastAPI(title="Quant Bot Backend", version="1.2.0", description="Coinbase algorithmic scanner and guarded Advanced Trade engine.")
+app = FastAPI(title="Quant Bot Backend", version="1.2.1", description="Coinbase algorithmic scanner and guarded Advanced Trade engine.")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
 
 COINBASE_API_KEY = os.getenv("COINBASE_API_KEY", "")
 COINBASE_API_SECRET = os.getenv("COINBASE_API_SECRET", "")
@@ -128,7 +136,7 @@ def start_algo() -> None:
 
 @app.get("/")
 def root() -> dict[str, Any]:
-    return {"name":"Quant Bot Backend","version":"1.2.0","status":"online","auto_trading":AUTO_TRADING,"trading_enabled":TRADING_ENABLED,"dry_run":DRY_RUN,"kill_switch":KILL_SWITCH,"products":AUTO_PRODUCTS,"scan_interval_seconds":SCAN_INTERVAL_SECONDS,"max_order_usd":MAX_ORDER_USD,"auto_order_usd":AUTO_ORDER_USD}
+    return {"name":"Quant Bot Backend","version":"1.2.1","status":"online","auto_trading":AUTO_TRADING,"trading_enabled":TRADING_ENABLED,"dry_run":DRY_RUN,"kill_switch":KILL_SWITCH,"products":AUTO_PRODUCTS,"scan_interval_seconds":SCAN_INTERVAL_SECONDS,"max_order_usd":MAX_ORDER_USD,"auto_order_usd":AUTO_ORDER_USD}
 
 @app.get("/health")
 def health() -> dict[str, Any]:
