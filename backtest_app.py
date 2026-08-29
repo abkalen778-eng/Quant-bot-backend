@@ -1,3 +1,4 @@
+import json
 from typing import Any
 
 from fastapi import HTTPException
@@ -113,6 +114,28 @@ def run_backtest(product: str, fee_bps: float = 40.0) -> dict[str, Any]:
         "trade_log": trades,
         "note": "Historical backtest only. Past performance does not guarantee future results.",
     }
+
+
+@app.on_event("startup")
+def startup_backtest() -> None:
+    summary = []
+    for product in ["BTC-USD", "ETH-USD", "SOL-USD"]:
+        try:
+            result = run_backtest(product, 40.0)
+            summary.append({
+                "product": result["product"],
+                "candles_tested": result["candles_tested"],
+                "trades": result["trades"],
+                "wins": result["wins"],
+                "losses": result["losses"],
+                "win_rate_pct": result["win_rate_pct"],
+                "strategy_return_pct": result["strategy_return_pct"],
+                "buy_hold_return_pct": result["buy_hold_return_pct"],
+                "max_drawdown_pct": result["max_drawdown_pct"],
+            })
+        except Exception as exc:
+            summary.append({"product": product, "error": f"{type(exc).__name__}: {exc}"})
+    print("BACKTEST_RESULTS=" + json.dumps(summary), flush=True)
 
 
 @app.get("/backtest/{product_id}")
