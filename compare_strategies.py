@@ -4,7 +4,7 @@ from datetime import datetime,timedelta,timezone
 import requests
 from main import app
 
-PUBLIC_BASE="https://api.exchange.coinbase.com"; HEADERS={"User-Agent":"quant-bot-abtest/4.0"}; PRODUCTS=["BTC-USD","ETH-USD","SOL-USD"]; FEE_BPS=40.0; TEST_DAYS=30
+PUBLIC_BASE="https://api.exchange.coinbase.com";HEADERS={"User-Agent":"quant-bot-abtest/5.0"};PRODUCTS=["BTC-USD","ETH-USD"];FEE_BPS=40.0;TEST_DAYS=30;STRICT_STOP_PCT=.0075
 
 def _fetch(product,g,start,end):
     rows={};cur=start;step=timedelta(seconds=g*280)
@@ -80,8 +80,19 @@ def _equilibrium_ok(price,sh,sl):return price<=(sh+sl)/2
 
 def _trend_ok(h,t):
     a=[x["close"] for x in h if x["time"]<t]
+    return len(a)>=50 and sum(a[-20:])/20>sum(a[-50:])/50
+
+def _momentum_ok(h,t):
+    a=[x["close"] for x in h if x["time"]<=t]
     if len(a)<50:return False
-    return sum(a[-20:])/20>sum(a[-50:])/50
+    s20=sum(a[-20:])/20;s50=sum(a[-50:])/50;ret6=a[-1]/a[-7]-1
+    return a[-1]>s20>s50 and ret6>.002
+
+def _volume_ok(f,t):
+    a=[x for x in f if x["time"]<=t]
+    if len(a)<25:return False
+    vols=[x["volume"] for x in a];avg20=sum(vols[-21:-1])/20;recent=sum(vols[-3:])/3;prior=sum(vols[-6:-3])/3;c=a[-1]
+    return c["close"]>c["open"] and vols[-1]>=avg20*1.10 and recent>prior
 
 def _metrics(trades):
     eq=peak=1.;dd=0.;wins=0
@@ -89,7 +100,7 @@ def _metrics(trades):
         eq*=1+t["net"];peak=max(peak,eq);dd=max(dd,(peak-eq)/peak);wins+=t["net"]>0
     return {"trades":len(trades),"wins":wins,"losses":len(trades)-wins,"win_rate_pct":round(100*wins/len(trades),2) if trades else 0.,"return_pct":round(100*(eq-1),2),"max_drawdown_pct":round(100*dd,2)}
 
-def _test(one,five,hourly,start,enhanced=False):
+def _test(one,five,hourly,start,extra=False):
     fee=FEE_BPS/10000.;trades=[];busy=0.
     for i in range(10,len(five)-10):
         c=five[i]
@@ -98,19 +109,21 @@ def _test(one,five,hourly,start,enhanced=False):
         if not s or not hl:continue
         sh,sl=s;hh,ll=hl;swept=next((l for l in (sl,ll) if c["low"]<l and c["close"]>l),None)
         if swept is None:continue
-        if enhanced:
-            four=_four_levels(hourly,c["time"])
-            if not four:continue
-            _,fl=four
-            if min(abs(c["low"]-sl)/sl,abs(c["low"]-ll)/ll,abs(c["low"]-fl)/fl)>.0075:continue
-            if not _trend_ok(hourly,c["time"]):continue
+        four=_four_levels(hourly,c["time"])
+        if not four:continue
+        _,fl=four
+        if min(abs(c["low"]-sl)/sl,abs(c["low"]-ll)/ll,abs(c["low"]-fl)/fl)>.0075:continue
+        if not _trend_ok(hourly,c["time"]):continue
         bi=_bos5(five,i,"BULLISH");ii=_ifvg(five,i,"BULLISH");ci=min([x for x in (bi,ii) if x is not None],default=None)
         if ci is None:continue
         e=_entry(one,five[ci]["time"],"BULLISH")
         if e is None:continue
-        if enhanced and (not _fvg_touch(five,e["time"]) or not _equilibrium_ok(e["close"],sh,sl)):continue
-        ep=e["close"];tp=_target(ep,sh,sl,hh,ll);stop=c["low"]
-        if tp is None or stop>=ep:continue
+        if not _fvg_touch(five,e["time"]) or not _equilibrium_ok(e["close"],sh,sl):continue
+        if extra and (not _momentum_ok(hourly,e["time"]) or not _volume_ok(five,e["time"])):continue
+        ep=e["close"];tp=_target(ep,sh,sl,hh,ll)
+        if tp is None:continue
+        stop=max(c["low"],ep*(1-STRICT_STOP_PCT)) if extra else c["low"]
+        if stop>=ep:continue
         xp=xt=None
         for x in one:
             if x["time"]<=e["time"]:continue
@@ -124,16 +137,16 @@ def run_comparison():
     now=datetime.now(timezone.utc).replace(second=0,microsecond=0);start=now-timedelta(days=TEST_DAYS);results=[]
     for p in PRODUCTS:
         one=_fetch(p,60,start-timedelta(hours=2),now);five=_fetch(p,300,start-timedelta(hours=4),now);hourly=_fetch(p,3600,start-timedelta(days=4),now)
-        results.append({"product":p,"tjr_core":_test(one,five,hourly,start.timestamp(),False),"tjr_plus_4_filters":_test(one,five,hourly,start.timestamp(),True)})
-    return {"period_days":TEST_DAYS,"fee_bps_per_side":FEE_BPS,"results":results,"filters":["4H liquidity proximity <= 0.75%","5m FVG pullback","discount/equilibrium location for longs","higher-timeframe 20h/50h trend alignment"],"note":"Long-only historical simulation matching Coinbase spot. Stops use the swept low; exits use the next session/hourly liquidity draw."}
+        results.append({"product":p,"tjr_plus_4_filters":_test(one,five,hourly,start.timestamp(),False),"tjr_plus_8_rules":_test(one,five,hourly,start.timestamp(),True)})
+    return {"period_days":TEST_DAYS,"fee_bps_per_side":FEE_BPS,"products":PRODUCTS,"results":results,"new_rules":["strong bullish momentum only","rising 5m volume >= 110% of 20-bar average","strict 0.75% maximum stop distance","BTC/ETH only"],"note":"Long-only historical simulation matching Coinbase spot. New version layers momentum, rising-volume, strict-stop, and major-coin rules on the existing four-filter TJR setup."}
 
 state={"status":"not_started","result":None,"error":None}
 def _worker():
     state["status"]="running"
     try:
-        r=run_comparison();state["result"]=r;state["status"]="complete";print("FOUR_FILTER_TEST="+json.dumps(r),flush=True)
-    except Exception as e:state["status"]="failed";state["error"]=f"{type(e).__name__}: {e}";print("FOUR_FILTER_TEST_ERROR="+state["error"],flush=True)
+        r=run_comparison();state["result"]=r;state["status"]="complete";print("EIGHT_RULE_TEST="+json.dumps(r),flush=True)
+    except Exception as e:state["status"]="failed";state["error"]=f"{type(e).__name__}: {e}";print("EIGHT_RULE_TEST_ERROR="+state["error"],flush=True)
 @app.on_event("startup")
-def start_comparison():threading.Thread(target=_worker,daemon=True,name="four-filter-test").start()
+def start_comparison():threading.Thread(target=_worker,daemon=True,name="eight-rule-test").start()
 @app.get("/compare-strategies")
 def compare_status():return state
