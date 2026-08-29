@@ -10,8 +10,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from coinbase.rest import RESTClient
+from liquidity_strategy import build_liquidity_signal
 
-app = FastAPI(title="Quant Bot Backend", version="1.2.1", description="Coinbase algorithmic scanner and guarded Advanced Trade engine.")
+app = FastAPI(title="Quant Bot Backend", version="2.0.0", description="Coinbase multi-timeframe liquidity strategy and guarded algorithmic engine.")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -31,7 +32,7 @@ AUTO_ORDER_USD = min(float(os.getenv("AUTO_ORDER_USD", "5")), MAX_ORDER_USD)
 SCAN_INTERVAL_SECONDS = max(int(os.getenv("SCAN_INTERVAL_SECONDS", "300")), 60)
 AUTO_PRODUCTS = [p.strip().upper() for p in os.getenv("AUTO_PRODUCTS", "BTC-USD,ETH-USD,SOL-USD").split(",") if p.strip()][:10]
 PUBLIC_BASE = "https://api.exchange.coinbase.com"
-DEFAULT_HEADERS = {"User-Agent": "quant-bot-backend/1.2"}
+DEFAULT_HEADERS = {"User-Agent": "quant-bot-backend/2.0"}
 
 bot_state: dict[str, Any] = {"running": False, "last_scan": None, "last_results": [], "dry_run_actions": [], "errors": []}
 state_lock = threading.Lock()
@@ -68,26 +69,12 @@ def _client() -> RESTClient:
     return RESTClient(api_key=COINBASE_API_KEY, api_secret=COINBASE_API_SECRET)
 
 def build_signal(product_id: str) -> dict[str, Any]:
-    product = product_id.upper()
-    candles = _get_json(f"{PUBLIC_BASE}/products/{product}/candles", {"granularity": 3600})
-    if not isinstance(candles, list) or len(candles) < 55:
-        raise HTTPException(status_code=502, detail=f"Not enough candle data for {product}")
-    candles = sorted(candles, key=lambda x: x[0])
-    closes = [float(x[4]) for x in candles]
-    current, s20, s50, r14 = closes[-1], _sma(closes,20), _sma(closes,50), _rsi(closes,14)
-    score, reasons = 0, []
-    if s20 is not None and s50 is not None:
-        if s20 > s50: score += 1; reasons.append("SMA20 is above SMA50")
-        else: score -= 1; reasons.append("SMA20 is below SMA50")
-    if r14 is not None:
-        if r14 < 35: score += 1; reasons.append("RSI is near oversold")
-        elif r14 > 70: score -= 1; reasons.append("RSI is overbought")
-        else: reasons.append("RSI is neutral")
-    if s20 is not None:
-        if current > s20: score += 1; reasons.append("Price is above SMA20")
-        else: score -= 1; reasons.append("Price is below SMA20")
-    signal = "BULLISH" if score >= 2 else "BEARISH" if score <= -2 else "NEUTRAL"
-    return {"product":product,"signal":signal,"score":score,"price":round(current,8),"sma20":round(s20,8) if s20 else None,"sma50":round(s50,8) if s50 else None,"rsi14":round(r14,2) if r14 is not None else None,"reasons":reasons,"timeframe":"1h"}
+    try:
+        return build_liquidity_signal(product_id.strip().upper())
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail=f"Coinbase strategy-data request failed: {exc}") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 def _execute(product: str, side: str, size_usd: float, require_signal: bool = True) -> dict[str, Any]:
     if KILL_SWITCH: raise HTTPException(status_code=423, detail="Trading kill switch is active")
@@ -98,7 +85,7 @@ def _execute(product: str, side: str, size_usd: float, require_signal: bool = Tr
         raise HTTPException(status_code=409, detail=f"Trade blocked: {side} requires {required}; current signal {sig['signal']}")
     oid, px = str(uuid.uuid4()), float(sig["price"])
     base = size_usd / px
-    preview = {"client_order_id":oid,"product_id":product,"side":side,"size_usd":round(size_usd,2),"estimated_base_size":round(base,12),"reference_price":px,"signal":sig["signal"]}
+    preview = {"client_order_id":oid,"product_id":product,"side":side,"size_usd":round(size_usd,2),"estimated_base_size":round(base,12),"reference_price":px,"signal":sig["signal"],"strategy":sig.get("strategy")}
     if DRY_RUN or not TRADING_ENABLED:
         return {"accepted":True,"executed":False,"mode":"DRY_RUN","preview":preview}
     client = _client()
@@ -112,13 +99,17 @@ def _algo_cycle() -> None:
     results, actions = [], []
     for product in AUTO_PRODUCTS:
         try:
-            sig = build_signal(product); results.append(sig)
-            if sig["signal"] == "BULLISH": actions.append(_execute(product,"BUY",AUTO_ORDER_USD,True))
-            elif sig["signal"] == "BEARISH": actions.append({"product":product,"action":"SELL_SIGNAL","executed":False,"note":"Automatic selling disabled until position tracking is added."})
+            sig = build_signal(product)
+            results.append(sig)
+            if sig["signal"] == "BULLISH":
+                actions.append(_execute(product,"BUY",AUTO_ORDER_USD,True))
+            elif sig["signal"] == "BEARISH":
+                actions.append({"product":product,"action":"BEARISH_SETUP","executed":False,"note":"Shorting/automatic sell execution remains disabled until position tracking and exit management are added."})
         except Exception as exc:
             results.append({"product":product,"error":type(exc).__name__})
     with state_lock:
-        bot_state["last_scan"] = datetime.now(timezone.utc).isoformat(); bot_state["last_results"] = results
+        bot_state["last_scan"] = datetime.now(timezone.utc).isoformat()
+        bot_state["last_results"] = results
         if actions: bot_state["dry_run_actions"] = (bot_state["dry_run_actions"] + actions)[-50:]
 
 def _loop() -> None:
@@ -136,11 +127,11 @@ def start_algo() -> None:
 
 @app.get("/")
 def root() -> dict[str, Any]:
-    return {"name":"Quant Bot Backend","version":"1.2.1","status":"online","auto_trading":AUTO_TRADING,"trading_enabled":TRADING_ENABLED,"dry_run":DRY_RUN,"kill_switch":KILL_SWITCH,"products":AUTO_PRODUCTS,"scan_interval_seconds":SCAN_INTERVAL_SECONDS,"max_order_usd":MAX_ORDER_USD,"auto_order_usd":AUTO_ORDER_USD}
+    return {"name":"Quant Bot Backend","version":"2.0.0","strategy":"liquidity_sweep_mtf_v1","status":"online","auto_trading":AUTO_TRADING,"trading_enabled":TRADING_ENABLED,"dry_run":DRY_RUN,"kill_switch":KILL_SWITCH,"products":AUTO_PRODUCTS,"scan_interval_seconds":SCAN_INTERVAL_SECONDS,"max_order_usd":MAX_ORDER_USD,"auto_order_usd":AUTO_ORDER_USD}
 
 @app.get("/health")
 def health() -> dict[str, Any]:
-    return {"ok":True,"time":datetime.now(timezone.utc).isoformat(),"credentials_present":bool(COINBASE_API_KEY and COINBASE_API_SECRET),"auto_trading":AUTO_TRADING,"trading_enabled":TRADING_ENABLED,"dry_run":DRY_RUN,"kill_switch":KILL_SWITCH}
+    return {"ok":True,"time":datetime.now(timezone.utc).isoformat(),"credentials_present":bool(COINBASE_API_KEY and COINBASE_API_SECRET),"auto_trading":AUTO_TRADING,"trading_enabled":TRADING_ENABLED,"dry_run":DRY_RUN,"kill_switch":KILL_SWITCH,"strategy":"liquidity_sweep_mtf_v1"}
 
 @app.get("/price/{product_id}")
 def price(product_id: str) -> dict[str, Any]:
@@ -156,7 +147,7 @@ def scan(products: str = "BTC-USD,ETH-USD,SOL-USD") -> dict[str, Any]:
     for p in [x.strip().upper() for x in products.split(",") if x.strip()][:10]:
         try: items.append(build_signal(p))
         except HTTPException as exc: items.append({"product":p,"error":exc.detail})
-    return {"count":len(items),"results":items}
+    return {"count":len(items),"strategy":"liquidity_sweep_mtf_v1","results":items}
 
 @app.post("/algo/run-once")
 def algo_run_once() -> dict[str, Any]:
@@ -165,7 +156,7 @@ def algo_run_once() -> dict[str, Any]:
 
 @app.get("/algo/status")
 def algo_status() -> dict[str, Any]:
-    with state_lock: return {**bot_state,"configured":AUTO_TRADING,"dry_run":DRY_RUN,"trading_enabled":TRADING_ENABLED,"kill_switch":KILL_SWITCH,"products":AUTO_PRODUCTS,"interval_seconds":SCAN_INTERVAL_SECONDS}
+    with state_lock: return {**bot_state,"configured":AUTO_TRADING,"dry_run":DRY_RUN,"trading_enabled":TRADING_ENABLED,"kill_switch":KILL_SWITCH,"products":AUTO_PRODUCTS,"interval_seconds":SCAN_INTERVAL_SECONDS,"strategy":"liquidity_sweep_mtf_v1"}
 
 @app.get("/coinbase-auth-check")
 def auth_check() -> dict[str, Any]:
