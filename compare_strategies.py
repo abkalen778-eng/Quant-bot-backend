@@ -5,9 +5,9 @@ import requests
 from main import app
 
 BASE="https://api.exchange.coinbase.com"
-HEADERS={"User-Agent":"quant-spot-breakout/1.0"}
+HEADERS={"User-Agent":"quant-spot-breakout/2.0"}
 PRODUCTS=["BTC-USD","ETH-USD","SOL-USD","XRP-USD","DOGE-USD","ADA-USD","AVAX-USD","LINK-USD"]
-DAYS=90
+DAYS=180
 FEE=.004
 RISK=.005
 
@@ -33,43 +33,41 @@ def metrics(ts):
 
 def test(daily,hourly,start):
  ts=[];trade_log=[];busy=0.
- for i in range(60,len(daily)):
+ for i in range(40,len(daily)):
   c=daily[i]
   if c["time"]<start or c["time"]<=busy:continue
 
-  prior60=daily[i-60:i]
-  resistance=max(x["high"] for x in prior60)
+  prior40=daily[i-40:i]
+  resistance=max(x["high"] for x in prior40)
   avg10=sum(x["volume"] for x in daily[i-10:i])/10
   vol_ratio=c["volume"]/avg10 if avg10 else 0.
 
-  # Tight consolidation directly under resistance before the breakout.
+  # Looser consolidation requirement to catch more valid breakout setups.
   pre=daily[i-5:i]
   pre_high=max(x["high"] for x in pre);pre_low=min(x["low"] for x in pre)
   consolidation=(pre_high-pre_low)/max(pre_low,1e-9)
-  near_resistance=(resistance-pre[-1]["close"])/resistance <= .05
+  near_resistance=(resistance-pre[-1]["close"])/resistance <= .08
 
-  # Buy only after a completed daily candle closes above prior 60-day resistance.
-  if vol_ratio<2.0 or consolidation>.06 or not near_resistance or c["close"]<=resistance:continue
+  # v2: accept 1.5x volume and a close above the prior 40-day high.
+  if vol_ratio<1.5 or consolidation>.08 or not near_resistance or c["close"]<=resistance:continue
 
   ep=c["close"]
-  initial_stop=max(ep*.93,resistance*.98)
+  initial_stop=max(ep*.92,resistance*.975)
   risk_frac=(ep-initial_stop)/ep
   if risk_frac<=0:continue
 
-  # Size position so the planned initial stop risks 0.5% of account equity.
   exposure=min(1.0,RISK/risk_frac)
   entry_time=c["time"]+86400
   peak=ep;stop=initial_stop;xp=None;xt=None;reason="open"
-  max_hold=entry_time+30*86400
+  max_hold=entry_time+45*86400
 
   for x in hourly:
    if x["time"]<entry_time:continue
    if x["time"]>max_hold:
-    xp=x["open"];xt=x["time"];reason="30d_time_stop";break
+    xp=x["open"];xt=x["time"];reason="45d_time_stop";break
    peak=max(peak,x["high"])
-   # Once price is +15%, use a 10% trailing stop so large spot breakouts can run.
-   if peak>=ep*1.15:stop=max(stop,peak*.90)
-   # Conservative intrabar assumption: stop is checked against the bar low.
+   # Start protecting gains earlier while still allowing large spot moves to run.
+   if peak>=ep*1.12:stop=max(stop,peak*.92)
    if x["low"]<=stop:
     xp=stop;xt=x["time"];reason="stop_or_trail";break
 
@@ -91,22 +89,22 @@ def run():
  res=[]
  for p in PRODUCTS:
   try:
-   daily=fetch(p,86400,start-timedelta(days=75),now)
+   daily=fetch(p,86400,start-timedelta(days=55),now)
    hourly=fetch(p,3600,start-timedelta(days=2),now)
    m,trades=test(daily,hourly,start.timestamp())
-   res.append({"product":p,"high_volume_spot_breakout_v1":m,"trade_log":trades})
+   res.append({"product":p,"high_volume_spot_breakout_v2":m,"trade_log":trades})
   except Exception as e:
    res.append({"product":p,"error":f"{type(e).__name__}: {e}"})
- return {"period_days":DAYS,"products":PRODUCTS,"results":res,"strategy":"high_volume_spot_breakout_v1","risk_per_trade_pct":0.5,"fee_bps_per_side":40.0,"rules":["spot long-only","prior 60-day high defines resistance","previous 5 days consolidate within 6% range and finish within 5% of resistance","breakout daily candle volume >= 2x prior 10-day average","buy after completed daily close above resistance","initial stop is tighter of 7% below entry or 2% below old resistance","risk 0.5% of account per trade with no leverage","after +15% gain trail 10% below peak","30-day maximum hold","fees included"]}
+ return {"period_days":DAYS,"products":PRODUCTS,"results":res,"strategy":"high_volume_spot_breakout_v2","risk_per_trade_pct":0.5,"fee_bps_per_side":40.0,"rules":["spot long-only","prior 40-day high defines resistance","previous 5 days consolidate within 8% range and finish within 8% of resistance","breakout daily candle volume >= 1.5x prior 10-day average","buy after completed daily close above resistance","initial stop is tighter of 8% below entry or 2.5% below old resistance","risk 0.5% of account per trade with no leverage","after +12% gain trail 8% below peak","45-day maximum hold","fees included"]}
 
 state={"status":"not_started","result":None,"error":None}
 def worker():
  state["status"]="running"
  try:
-  r=run();state["result"]=r;state["status"]="complete";print("HIGH_VOLUME_SPOT_BREAKOUT_BACKTEST="+json.dumps(r),flush=True)
+  r=run();state["result"]=r;state["status"]="complete";print("HIGH_VOLUME_SPOT_BREAKOUT_V2_BACKTEST="+json.dumps(r),flush=True)
  except Exception as e:
-  state["status"]="failed";state["error"]=f"{type(e).__name__}: {e}";print("HIGH_VOLUME_SPOT_BREAKOUT_ERROR="+state["error"],flush=True)
+  state["status"]="failed";state["error"]=f"{type(e).__name__}: {e}";print("HIGH_VOLUME_SPOT_BREAKOUT_V2_ERROR="+state["error"],flush=True)
 @app.on_event("startup")
-def startup():threading.Thread(target=worker,daemon=True,name="high-volume-spot-breakout-test").start()
+def startup():threading.Thread(target=worker,daemon=True,name="high-volume-spot-breakout-v2-test").start()
 @app.get("/compare-strategies")
 def status():return state
