@@ -3,7 +3,9 @@ from typing import Any
 import requests
 
 PUBLIC_BASE="https://api.exchange.coinbase.com"
-HEADERS={"User-Agent":"quant-bot-tjr-filtered/4.0"}
+HEADERS={"User-Agent":"quant-bot-tjr-filtered/5.0"}
+ALLOWED_PRODUCTS={"BTC-USD","ETH-USD"}
+STRICT_STOP_PCT=0.0075
 
 def _candles(product:str,granularity:int)->list[dict[str,float]]:
     r=requests.get(f"{PUBLIC_BASE}/products/{product.upper()}/candles",params={"granularity":granularity},headers=HEADERS,timeout=12);r.raise_for_status()
@@ -18,7 +20,7 @@ def _hourly_levels(h,n=12):
 
 def _four_hour_levels(h):
     buckets={}
-    for c in h[:-1]: buckets.setdefault(int(c["time"]//14400),[]).append(c)
+    for c in h[:-1]:buckets.setdefault(int(c["time"]//14400),[]).append(c)
     vals=[]
     for b in sorted(buckets)[-10:]:
         a=buckets[b];vals.append((max(x["high"] for x in a),min(x["low"] for x in a)))
@@ -35,8 +37,7 @@ def _sweep(five,levels,search=12):
 def _five_bos(five,sweep):
     i=sweep["index"];pre=five[max(0,i-4):i];post=five[i+1:]
     if len(pre)<3:return False
-    if sweep["direction"]=="BULLISH":return any(x["close"]>max(y["high"] for y in pre) for x in post)
-    return any(x["close"]<min(y["low"] for y in pre) for x in post)
+    return any(x["close"]>max(y["high"] for y in pre) for x in post) if sweep["direction"]=="BULLISH" else any(x["close"]<min(y["low"] for y in pre) for x in post)
 
 def _inverse_fvg(five,direction,lookback=12):
     for i in range(max(2,len(five)-lookback),len(five)):
@@ -77,24 +78,39 @@ def _trend_ok(direction,h):
     s20=sum(closes[-20:])/20;s50=sum(closes[-50:])/50
     return s20>s50 if direction=="BULLISH" else s20<s50
 
-def _proximity_ok(sweep_price,levels,pct=.0075):
-    return min(abs(sweep_price-l)/l for _,l in levels)<=pct
+def _momentum_ok(direction,h):
+    closes=[x["close"] for x in h]
+    if len(closes)<50:return False
+    s20=sum(closes[-20:])/20;s50=sum(closes[-50:])/50;ret6=closes[-1]/closes[-7]-1
+    return (closes[-1]>s20>s50 and ret6>0.002) if direction=="BULLISH" else (closes[-1]<s20<s50 and ret6<-0.002)
+
+def _volume_ok(direction,five):
+    if len(five)<25:return False
+    vols=[x["volume"] for x in five];avg20=sum(vols[-21:-1])/20;recent=sum(vols[-3:])/3;prior=sum(vols[-6:-3])/3;c=five[-1]
+    directional=c["close"]>c["open"] if direction=="BULLISH" else c["close"]<c["open"]
+    return directional and vols[-1]>=avg20*1.10 and recent>prior
+
+def _proximity_ok(sweep_price,levels,pct=.0075):return min(abs(sweep_price-l)/l for _,l in levels)<=pct
 
 def _exit_draw(direction,price,levels):
     c=[(n,l) for n,l in levels if (l>price if direction=="BULLISH" else l<price)]
     if not c:return None
     n,l=min(c,key=lambda x:abs(x[1]-price));return {"level_name":n,"price":l}
 
+def _strict_stop(direction,price):
+    return price*(1-STRICT_STOP_PCT) if direction=="BULLISH" else price*(1+STRICT_STOP_PCT)
+
 def build_liquidity_signal(product:str)->dict[str,Any]:
-    product=product.upper();one=_candles(product,60);five=_candles(product,300);hourly=_candles(product,3600)
+    product=product.upper()
+    if product not in ALLOWED_PRODUCTS:return {"product":product,"signal":"NO_TRADE","trade_ready":False,"reasons":["Major-coin filter: only BTC-USD and ETH-USD are enabled"],"strategy":"tjr_core_plus_8_rules_v1"}
+    one=_candles(product,60);five=_candles(product,300);hourly=_candles(product,3600)
     if len(one)<40 or len(five)<40 or len(hourly)<60:raise ValueError(f"Not enough market data for {product}")
     sh,sl=_session_levels(hourly);hh,hl=_hourly_levels(hourly);fh,fl=_four_hour_levels(hourly)
-    core_levels=[("session_high",sh),("session_low",sl),("hourly_high",hh),("hourly_low",hl)]
-    all_levels=core_levels+[("four_hour_high",fh),("four_hour_low",fl)]
+    core_levels=[("session_high",sh),("session_low",sl),("hourly_high",hh),("hourly_low",hl)];all_levels=core_levels+[("four_hour_high",fh),("four_hour_low",fl)]
     price=one[-1]["close"];sweep=_sweep(five,core_levels)
-    if not sweep:return {"product":product,"signal":"NO_TRADE","trade_ready":False,"price":price,"reasons":["No session/hourly liquidity sweep"],"strategy":"tjr_core_plus_4_filters_v1"}
+    if not sweep:return {"product":product,"signal":"NO_TRADE","trade_ready":False,"price":price,"reasons":["No session/hourly liquidity sweep"],"strategy":"tjr_core_plus_8_rules_v1"}
     d=sweep["direction"];rev=_five_bos(five,sweep) or _inverse_fvg(five,d);cont,cont_reason=_continuation(one,d);target=_exit_draw(d,price,core_levels)
-    proximity=_proximity_ok(sweep["sweep_price"],all_levels);fvg=_fvg_pullback(five,d);eq=_equilibrium_ok(d,price,sh,sl);trend=_trend_ok(d,hourly)
-    ready=rev and cont and target is not None and proximity and fvg and eq and trend
-    reasons=[f"{sweep['level_name']} swept","5m BOS/iFVG confirmed" if rev else "waiting for 5m BOS/iFVG",cont_reason,f"4H liquidity proximity: {proximity}",f"5m FVG pullback: {fvg}",f"equilibrium location: {eq}",f"HTF trend aligned: {trend}"]
-    return {"product":product,"signal":d if ready else "NO_TRADE","direction":d,"trade_ready":ready,"price":price,"reasons":reasons,"liquidity_sweep":sweep,"take_profit":target,"filters":{"four_hour_liquidity_proximity":proximity,"five_minute_fvg_pullback":fvg,"equilibrium_location":eq,"higher_timeframe_trend_alignment":trend},"levels":dict(all_levels),"strategy":"tjr_core_plus_4_filters_v1"}
+    proximity=_proximity_ok(sweep["sweep_price"],all_levels);fvg=_fvg_pullback(five,d);eq=_equilibrium_ok(d,price,sh,sl);trend=_trend_ok(d,hourly);momentum=_momentum_ok(d,hourly);volume=_volume_ok(d,five);stop=_strict_stop(d,price)
+    ready=rev and cont and target is not None and proximity and fvg and eq and trend and momentum and volume
+    reasons=[f"{sweep['level_name']} swept","5m BOS/iFVG confirmed" if rev else "waiting for 5m BOS/iFVG",cont_reason,f"4H liquidity proximity: {proximity}",f"5m FVG pullback: {fvg}",f"equilibrium location: {eq}",f"HTF trend aligned: {trend}",f"strong momentum: {momentum}",f"rising volume confirmation: {volume}"]
+    return {"product":product,"signal":d if ready else "NO_TRADE","direction":d,"trade_ready":ready,"price":price,"reasons":reasons,"liquidity_sweep":sweep,"take_profit":target,"stop_loss":{"price":stop,"distance_pct":STRICT_STOP_PCT*100},"filters":{"four_hour_liquidity_proximity":proximity,"five_minute_fvg_pullback":fvg,"equilibrium_location":eq,"higher_timeframe_trend_alignment":trend,"momentum":momentum,"rising_volume":volume,"major_coin":True},"levels":dict(all_levels),"strategy":"tjr_core_plus_8_rules_v1"}
