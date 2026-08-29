@@ -3,7 +3,7 @@ from typing import Any
 
 from fastapi import HTTPException
 
-from main import app, _get_json, _sma, _rsi, PUBLIC_BASE
+from main import app, _get_json, _sma, _rsi, PUBLIC_BASE, build_signal
 
 
 def _historical_candles(product: str, granularity: int = 3600) -> list[list[Any]]:
@@ -155,3 +155,73 @@ def backtest_all(products: str = "BTC-USD,ETH-USD,SOL-USD", fee_bps: float = 40.
         except HTTPException as exc:
             results.append({"product": product, "error": exc.detail})
     return {"count": len(results), "results": results}
+
+
+# Read-only tool surface intended for ChatGPT/custom-tool integrations.
+# Trading endpoints are deliberately excluded from this tool schema.
+@app.get("/tools/status")
+def tool_status() -> dict[str, Any]:
+    return {"name": "Quant Bot Tools", "status": "online", "mode": "read-only", "live_trading_exposed": False}
+
+
+@app.get("/tools/signal/{product_id}")
+def tool_signal(product_id: str) -> dict[str, Any]:
+    return build_signal(product_id)
+
+
+@app.get("/tools/backtest/{product_id}")
+def tool_backtest(product_id: str, fee_bps: float = 40.0) -> dict[str, Any]:
+    return run_backtest(product_id, fee_bps)
+
+
+@app.get("/.well-known/ai-plugin.json")
+def plugin_manifest() -> dict[str, Any]:
+    return {
+        "schema_version": "v1",
+        "name_for_human": "Quant Bot Tools",
+        "name_for_model": "quant_bot_tools",
+        "description_for_human": "Read-only crypto signals and historical backtests from the Quant Bot.",
+        "description_for_model": "Use this tool to inspect Quant Bot status, get crypto signals, and run historical backtests. It cannot place trades.",
+        "auth": {"type": "none"},
+        "api": {"type": "openapi", "url": "https://quant-bot-backend-production.up.railway.app/plugin-openapi.json"},
+        "logo_url": "https://quant-bot-backend-production.up.railway.app/docs",
+        "contact_email": "support@example.com",
+        "legal_info_url": "https://quant-bot-backend-production.up.railway.app/docs",
+    }
+
+
+@app.get("/plugin-openapi.json")
+def plugin_openapi() -> dict[str, Any]:
+    return {
+        "openapi": "3.0.3",
+        "info": {"title": "Quant Bot Tools", "version": "1.0.0"},
+        "servers": [{"url": "https://quant-bot-backend-production.up.railway.app"}],
+        "paths": {
+            "/tools/status": {
+                "get": {
+                    "operationId": "getQuantBotStatus",
+                    "summary": "Get Quant Bot tool status",
+                    "responses": {"200": {"description": "Bot status"}},
+                }
+            },
+            "/tools/signal/{product_id}": {
+                "get": {
+                    "operationId": "getQuantSignal",
+                    "summary": "Get a current quantitative signal",
+                    "parameters": [{"name": "product_id", "in": "path", "required": True, "schema": {"type": "string"}}],
+                    "responses": {"200": {"description": "Signal result"}},
+                }
+            },
+            "/tools/backtest/{product_id}": {
+                "get": {
+                    "operationId": "runQuantBacktest",
+                    "summary": "Run a historical backtest",
+                    "parameters": [
+                        {"name": "product_id", "in": "path", "required": True, "schema": {"type": "string"}},
+                        {"name": "fee_bps", "in": "query", "required": False, "schema": {"type": "number", "default": 40}},
+                    ],
+                    "responses": {"200": {"description": "Backtest result"}},
+                }
+            },
+        },
+    }
