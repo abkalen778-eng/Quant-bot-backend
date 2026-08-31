@@ -11,8 +11,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from coinbase.rest import RESTClient
 from liquidity_strategy import build_confirmed_breakout_signal
+from tjr_strategy import build_tjr_core_signal
 
-STRATEGY_NAME = "confirmed_breakout_v1"
+STRATEGY_NAME = "confirmed_breakout_v1+tjr_core_v1"
 FEE_RATE = 0.004
 SLIPPAGE_RATE = 0.001
 app = FastAPI(title="Quant Bot Backend", version="3.1.0", description="Coinbase confirmed-breakout paper scanner with paper P/L tracking and guarded execution controls.")
@@ -24,6 +25,9 @@ TRADING_ENABLED = os.getenv("TRADING_ENABLED", "false").lower() == "true"
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 KILL_SWITCH = os.getenv("KILL_SWITCH", "false").lower() == "true"
 AUTO_TRADING = os.getenv("AUTO_TRADING", "false").lower() == "true"
+TJR_ENABLED = os.getenv("TJR_ENABLED", "true").lower() == "true"
+# TJR must pass paper verification and managed-live-exit verification before this is enabled.
+TJR_LIVE_ENABLED = os.getenv("TJR_LIVE_ENABLED", "false").lower() == "true"
 MAX_ORDER_USD = float(os.getenv("MAX_ORDER_USD", "10"))
 AUTO_ORDER_USD = min(float(os.getenv("AUTO_ORDER_USD", "5")), MAX_ORDER_USD)
 SCAN_INTERVAL_SECONDS = max(int(os.getenv("SCAN_INTERVAL_SECONDS", "300")), 60)
@@ -87,6 +91,30 @@ def build_signal(product_id: str) -> dict[str, Any]:
     except ValueError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
+
+def build_strategy_signals(product_id: str) -> list[dict[str, Any]]:
+    signals = [build_signal(product_id)]
+    if TJR_ENABLED:
+        try:
+            signals.append(build_tjr_core_signal(product_id.strip().upper()))
+        except requests.RequestException as exc:
+            signals.append({
+                "product": product_id.strip().upper(),
+                "strategy": "tjr_core_v1",
+                "signal": "NO_TRADE",
+                "trade_ready": False,
+                "error": f"Coinbase strategy-data request failed: {type(exc).__name__}",
+            })
+        except ValueError as exc:
+            signals.append({
+                "product": product_id.strip().upper(),
+                "strategy": "tjr_core_v1",
+                "signal": "NO_TRADE",
+                "trade_ready": False,
+                "error": str(exc),
+            })
+    return signals
+
 def _execute(product: str, side: str, size_usd: float, require_signal: bool = True) -> dict[str, Any]:
     if KILL_SWITCH:
         raise HTTPException(status_code=423, detail="Trading kill switch is active")
@@ -126,7 +154,9 @@ def _open_paper_position(sig: dict[str, Any], notional: float) -> dict[str, Any]
         "trail_active": False,
         "status": "OPEN",
         "strategy": STRATEGY_NAME,
+        "take_profit": (sig.get("take_profit") or {}).get("price"),
     }
+    pos["strategy"] = sig.get("strategy", STRATEGY_NAME)
     bot_state["paper_positions"][product] = pos
     return pos
 
@@ -152,9 +182,13 @@ def _update_paper_positions() -> None:
         held_days = max(0.0, (now.timestamp() - float(pos["entry_timestamp"])) / 86400.0)
         reason = None
         exit_price = None
+        take_profit = pos.get("take_profit")
         if price <= stop:
             exit_price = min(price, stop) * (1.0 - SLIPPAGE_RATE)
             reason = "stop_or_trail"
+        elif take_profit is not None and price >= float(take_profit):
+            exit_price = max(price, float(take_profit)) * (1.0 - SLIPPAGE_RATE)
+            reason = "liquidity_target"
         elif held_days >= 45.0:
             exit_price = price * (1.0 - SLIPPAGE_RATE)
             reason = "45d_time_stop"
@@ -199,22 +233,42 @@ def _algo_cycle() -> None:
         open_products = set(bot_state["paper_positions"].keys())
     for product in AUTO_PRODUCTS:
         try:
-            sig = build_signal(product)
-            results.append(sig)
-            key = sig.get("signal_key")
-            if sig["signal"] == "BULLISH" and key:
+            product_signals = build_strategy_signals(product)
+            results.extend(product_signals)
+            for sig in product_signals:
+                key = sig.get("signal_key")
+                strategy = sig.get("strategy")
+                if sig.get("signal") != "BULLISH" or not key:
+                    continue
                 if product in open_products:
-                    actions.append({"product": product, "action": "OPEN_PAPER_POSITION_EXISTS", "executed": False, "signal_key": key})
-                elif key not in processed:
-                    action = _execute(product, "BUY", AUTO_ORDER_USD, True)
+                    actions.append({"product": product, "strategy": strategy, "action": "OPEN_POSITION_EXISTS", "executed": False, "signal_key": key})
+                elif key in processed:
+                    actions.append({"product": product, "strategy": strategy, "action": "DUPLICATE_SIGNAL_SKIPPED", "executed": False, "signal_key": key})
+                else:
+                    if strategy == "tjr_core_v1" and not TJR_LIVE_ENABLED:
+                        action = {
+                            "accepted": True,
+                            "executed": False,
+                            "mode": "PAPER_TEST",
+                            "strategy": strategy,
+                            "preview": {
+                                "product_id": product,
+                                "side": "BUY",
+                                "size_usd": AUTO_ORDER_USD,
+                                "reference_price": sig.get("price"),
+                                "signal_key": key,
+                                "stop_loss": sig.get("stop_loss"),
+                                "take_profit": sig.get("take_profit"),
+                            },
+                        }
+                    else:
+                        action = _execute(product, "BUY", AUTO_ORDER_USD, True)
                     with state_lock:
                         paper = _open_paper_position(sig, AUTO_ORDER_USD)
                     action["paper_position"] = paper
                     actions.append(action)
                     processed.add(key)
                     open_products.add(product)
-                else:
-                    actions.append({"product": product, "action": "DUPLICATE_SIGNAL_SKIPPED", "executed": False, "signal_key": key})
         except Exception as exc:
             results.append({"product": product, "error": type(exc).__name__})
     with state_lock:
@@ -242,11 +296,11 @@ def start_algo() -> None:
 
 @app.get("/")
 def root() -> dict[str, Any]:
-    return {"name": "Quant Bot Backend", "version": "3.1.0", "strategy": STRATEGY_NAME, "status": "online", "auto_trading": AUTO_TRADING, "trading_enabled": TRADING_ENABLED, "dry_run": DRY_RUN, "kill_switch": KILL_SWITCH, "products": AUTO_PRODUCTS, "scan_interval_seconds": SCAN_INTERVAL_SECONDS, "max_order_usd": MAX_ORDER_USD, "auto_order_usd": AUTO_ORDER_USD}
+    return {"name": "Quant Bot Backend", "version": "3.2.0", "strategy": STRATEGY_NAME, "status": "online", "auto_trading": AUTO_TRADING, "trading_enabled": TRADING_ENABLED, "dry_run": DRY_RUN, "kill_switch": KILL_SWITCH, "tjr_enabled": TJR_ENABLED, "tjr_live_enabled": TJR_LIVE_ENABLED, "products": AUTO_PRODUCTS, "scan_interval_seconds": SCAN_INTERVAL_SECONDS, "max_order_usd": MAX_ORDER_USD, "auto_order_usd": AUTO_ORDER_USD}
 
 @app.get("/health")
 def health() -> dict[str, Any]:
-    return {"ok": True, "time": datetime.now(timezone.utc).isoformat(), "credentials_present": bool(COINBASE_API_KEY and COINBASE_API_SECRET), "auto_trading": AUTO_TRADING, "trading_enabled": TRADING_ENABLED, "dry_run": DRY_RUN, "kill_switch": KILL_SWITCH, "strategy": STRATEGY_NAME}
+    return {"ok": True, "time": datetime.now(timezone.utc).isoformat(), "credentials_present": bool(COINBASE_API_KEY and COINBASE_API_SECRET), "auto_trading": AUTO_TRADING, "trading_enabled": TRADING_ENABLED, "dry_run": DRY_RUN, "kill_switch": KILL_SWITCH, "tjr_enabled": TJR_ENABLED, "tjr_live_enabled": TJR_LIVE_ENABLED, "strategy": STRATEGY_NAME}
 
 @app.get("/price/{product_id}")
 def price(product_id: str) -> dict[str, Any]:
@@ -262,7 +316,7 @@ def scan(products: str = "BTC-USD,ETH-USD,SOL-USD") -> dict[str, Any]:
     items = []
     for p in [x.strip().upper() for x in products.split(",") if x.strip()][:20]:
         try:
-            items.append(build_signal(p))
+            items.extend(build_strategy_signals(p))
         except HTTPException as exc:
             items.append({"product": p, "error": exc.detail})
     return {"count": len(items), "strategy": STRATEGY_NAME, "results": items}
