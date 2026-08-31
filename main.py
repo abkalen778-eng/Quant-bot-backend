@@ -13,7 +13,10 @@ from coinbase.rest import RESTClient
 from liquidity_strategy import build_confirmed_breakout_signal
 from tjr_strategy import build_tjr_core_signal
 
-STRATEGY_NAME = "confirmed_breakout_v1+tjr_core_v1"
+SUPPORTED_STRATEGIES = {"confirmed_breakout_v1", "tjr_core_v1"}
+STRATEGY_NAME = os.getenv("ACTIVE_STRATEGY", "tjr_core_v1").strip().lower()
+if STRATEGY_NAME not in SUPPORTED_STRATEGIES:
+    raise RuntimeError(f"Unsupported ACTIVE_STRATEGY: {STRATEGY_NAME}")
 FEE_RATE = 0.004
 SLIPPAGE_RATE = 0.001
 app = FastAPI(title="Quant Bot Backend", version="3.1.0", description="Coinbase confirmed-breakout paper scanner with paper P/L tracking and guarded execution controls.")
@@ -25,7 +28,6 @@ TRADING_ENABLED = os.getenv("TRADING_ENABLED", "false").lower() == "true"
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 KILL_SWITCH = os.getenv("KILL_SWITCH", "false").lower() == "true"
 AUTO_TRADING = os.getenv("AUTO_TRADING", "false").lower() == "true"
-TJR_ENABLED = os.getenv("TJR_ENABLED", "true").lower() == "true"
 # TJR must pass paper verification and managed-live-exit verification before this is enabled.
 TJR_LIVE_ENABLED = os.getenv("TJR_LIVE_ENABLED", "false").lower() == "true"
 MAX_ORDER_USD = float(os.getenv("MAX_ORDER_USD", "10"))
@@ -85,7 +87,10 @@ def _ticker_price(product: str) -> float:
 
 def build_signal(product_id: str) -> dict[str, Any]:
     try:
-        return build_confirmed_breakout_signal(product_id.strip().upper())
+        product = product_id.strip().upper()
+        if STRATEGY_NAME == "tjr_core_v1":
+            return build_tjr_core_signal(product)
+        return build_confirmed_breakout_signal(product)
     except requests.RequestException as exc:
         raise HTTPException(status_code=502, detail=f"Coinbase strategy-data request failed: {exc}") from exc
     except ValueError as exc:
@@ -93,27 +98,7 @@ def build_signal(product_id: str) -> dict[str, Any]:
 
 
 def build_strategy_signals(product_id: str) -> list[dict[str, Any]]:
-    signals = [build_signal(product_id)]
-    if TJR_ENABLED:
-        try:
-            signals.append(build_tjr_core_signal(product_id.strip().upper()))
-        except requests.RequestException as exc:
-            signals.append({
-                "product": product_id.strip().upper(),
-                "strategy": "tjr_core_v1",
-                "signal": "NO_TRADE",
-                "trade_ready": False,
-                "error": f"Coinbase strategy-data request failed: {type(exc).__name__}",
-            })
-        except ValueError as exc:
-            signals.append({
-                "product": product_id.strip().upper(),
-                "strategy": "tjr_core_v1",
-                "signal": "NO_TRADE",
-                "trade_ready": False,
-                "error": str(exc),
-            })
-    return signals
+    return [build_signal(product_id)]
 
 def _execute(product: str, side: str, size_usd: float, require_signal: bool = True) -> dict[str, Any]:
     if KILL_SWITCH:
@@ -127,6 +112,8 @@ def _execute(product: str, side: str, size_usd: float, require_signal: bool = Tr
     oid, px = str(uuid.uuid4()), float(sig["price"])
     base = size_usd / px
     preview = {"client_order_id": oid, "product_id": product, "side": side, "size_usd": round(size_usd, 2), "estimated_base_size": round(base, 12), "reference_price": px, "signal": sig["signal"], "signal_key": sig.get("signal_key"), "strategy": sig.get("strategy"), "stop_loss": sig.get("stop_loss"), "exit_plan": sig.get("exit_plan")}
+    if sig.get("strategy") == "tjr_core_v1" and not TJR_LIVE_ENABLED:
+        return {"accepted": True, "executed": False, "mode": "PAPER_TEST", "preview": preview}
     if DRY_RUN or not TRADING_ENABLED:
         return {"accepted": True, "executed": False, "mode": "DRY_RUN", "preview": preview}
     client = _client()
@@ -245,24 +232,7 @@ def _algo_cycle() -> None:
                 elif key in processed:
                     actions.append({"product": product, "strategy": strategy, "action": "DUPLICATE_SIGNAL_SKIPPED", "executed": False, "signal_key": key})
                 else:
-                    if strategy == "tjr_core_v1" and not TJR_LIVE_ENABLED:
-                        action = {
-                            "accepted": True,
-                            "executed": False,
-                            "mode": "PAPER_TEST",
-                            "strategy": strategy,
-                            "preview": {
-                                "product_id": product,
-                                "side": "BUY",
-                                "size_usd": AUTO_ORDER_USD,
-                                "reference_price": sig.get("price"),
-                                "signal_key": key,
-                                "stop_loss": sig.get("stop_loss"),
-                                "take_profit": sig.get("take_profit"),
-                            },
-                        }
-                    else:
-                        action = _execute(product, "BUY", AUTO_ORDER_USD, True)
+                    action = _execute(product, "BUY", AUTO_ORDER_USD, True)
                     with state_lock:
                         paper = _open_paper_position(sig, AUTO_ORDER_USD)
                     action["paper_position"] = paper
@@ -296,11 +266,11 @@ def start_algo() -> None:
 
 @app.get("/")
 def root() -> dict[str, Any]:
-    return {"name": "Quant Bot Backend", "version": "3.2.0", "strategy": STRATEGY_NAME, "status": "online", "auto_trading": AUTO_TRADING, "trading_enabled": TRADING_ENABLED, "dry_run": DRY_RUN, "kill_switch": KILL_SWITCH, "tjr_enabled": TJR_ENABLED, "tjr_live_enabled": TJR_LIVE_ENABLED, "products": AUTO_PRODUCTS, "scan_interval_seconds": SCAN_INTERVAL_SECONDS, "max_order_usd": MAX_ORDER_USD, "auto_order_usd": AUTO_ORDER_USD}
+    return {"name": "Quant Bot Backend", "version": "3.2.0", "strategy": STRATEGY_NAME, "supported_strategies": sorted(SUPPORTED_STRATEGIES), "status": "online", "auto_trading": AUTO_TRADING, "trading_enabled": TRADING_ENABLED, "dry_run": DRY_RUN, "kill_switch": KILL_SWITCH, "tjr_live_enabled": TJR_LIVE_ENABLED, "products": AUTO_PRODUCTS, "scan_interval_seconds": SCAN_INTERVAL_SECONDS, "max_order_usd": MAX_ORDER_USD, "auto_order_usd": AUTO_ORDER_USD}
 
 @app.get("/health")
 def health() -> dict[str, Any]:
-    return {"ok": True, "time": datetime.now(timezone.utc).isoformat(), "credentials_present": bool(COINBASE_API_KEY and COINBASE_API_SECRET), "auto_trading": AUTO_TRADING, "trading_enabled": TRADING_ENABLED, "dry_run": DRY_RUN, "kill_switch": KILL_SWITCH, "tjr_enabled": TJR_ENABLED, "tjr_live_enabled": TJR_LIVE_ENABLED, "strategy": STRATEGY_NAME}
+    return {"ok": True, "time": datetime.now(timezone.utc).isoformat(), "credentials_present": bool(COINBASE_API_KEY and COINBASE_API_SECRET), "auto_trading": AUTO_TRADING, "trading_enabled": TRADING_ENABLED, "dry_run": DRY_RUN, "kill_switch": KILL_SWITCH, "tjr_live_enabled": TJR_LIVE_ENABLED, "strategy": STRATEGY_NAME}
 
 @app.get("/price/{product_id}")
 def price(product_id: str) -> dict[str, Any]:
